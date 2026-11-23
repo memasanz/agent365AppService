@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": { "value": "westeurope" },
+    "webAppName": { "value": "REPLACE-WITH-GLOBALLY-UNIQUE-APP-NAME" },
+    "planName": { "value": "agent365-learning-plan" },
+    "managedIdentityName": { "value": "agent365-blueprint-mi" },
+    "sku": { "value": "B1" },
+    "callerCidrs": { "value": ["203.0.113.10/32"] },
+    "scmCallerCidrs": { "value": ["198.51.100.10/32"] },
+    "existingUserAssignedIdentityIds": { "value": [] }
+  }
+}
