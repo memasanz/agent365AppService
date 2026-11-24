@@ -4,6 +4,19 @@ A Python 3.12, Microsoft Agent Framework agent running in Linux Azure App Servic
 
 This is a single-turn educational sample, not a production public API. No frontend, tools, Graph/Blob workload access, OBO, client secrets, agent users, hosted Foundry runtime, AI Gateway, streaming, or durable conversation storage is involved. External registration stores metadata; it neither hosts nor proxies `/chat`.
 
+## Walkthrough
+
+| Step | What you do | Script / notebook |
+| --- | --- | --- |
+| 1 | Create the Agent 365 provisioning app registration (one-time; an authorized administrator). It also writes `ENTRA_PROVISIONING_CLIENT_ID` to `.env`. | `scripts\New-AgentIdentityProvisioningClient.ps1` |
+| 2 | Deploy the App Service, with optional Entra authentication for the HTTP API. | `scripts\deploy.ps1` (and `scripts\configure-http-auth.ps1` for public mode), then `scripts\verify.ps1` |
+| 3 | Talk to the deployed agent. | `notebooks\00_talk_to_agent.ipynb` |
+| 4 | Register the agent with Agent 365 and Foundry. | `notebooks\01_register_with_agent365.ipynb` |
+| 5 | Activate telemetry for both destinations. | `scripts\enable-observability.ps1` |
+| 6 | Invoke the agent and verify the traces. | Steps below |
+
+Steps 1 and 2 are independent; do both before step 4. Do not start step 4 until step 3 gets a real model reply. [scripts\README.md](scripts/README.md) describes each script and its functions.
+
 ## Prerequisites and costs
 
 - PowerShell **7+**, Git, Azure CLI with Bicep, `uv`, Python 3.12, and VS Code Python/Jupyter support.
@@ -14,15 +27,15 @@ This is a single-turn educational sample, not a production public API. No fronte
 
 **Charges:** App Service B1 is billable while provisioned, including idle time. Model calls, Application Insights ingestion/retention, applicable Agent 365 licensing, and network traffic can incur charges. Prices and capacity depend on region/subscription. Deployment describes changes and requires `-Approve`; role creation requires its own explicit switch. Nothing in local setup/tests provisions Azure resources.
 
-### Agent 365 notebook administrative permissions (not HTTP Easy Auth)
+## Step 1. Create the provisioning app registration
 
 The following provisioning client is only for the later Agent 365 onboarding notebook. It is separate from the HTTP API registration used by Easy Auth; deploying and calling the app does not require this desktop redirect.
 
 For notebook onboarding, ask an authorized tenant administrator to configure a dedicated **single-tenant public provisioning client**, with Mobile and desktop redirect **`http://localhost:8400`**, appropriate public-client configuration, and explicit admin consent to these **delegated Microsoft Graph** permissions. Consent and caller authority are separate prerequisites; neither is granted by the notebook.
 
-#### Create the notebook provisioning app registration
+### Run the provisioning script
 
-Use `scripts\New-AgentIdentityProvisioningClient.ps1`. Its default display name is **`Agent365IdentityProvisioner`**: this is an administrative sign-in client, not the UAMI or the HTTP Easy Auth API registration. The script creates/reuses the ordinary app and its service principal, configures the desktop redirect and all eight delegated permissions below, and verifies the result. It creates no secrets and does not change App Service or `.env`.
+Use `scripts\New-AgentIdentityProvisioningClient.ps1`. Its default display name is **`Agent365IdentityProvisioner`**: this is an administrative sign-in client, not the UAMI or the HTTP Easy Auth API registration. The script creates/reuses the ordinary app and its service principal, configures the desktop redirect and all eight delegated permissions below, and verifies the result. It creates no secrets and does not change App Service.
 
 From this repository root, an authorized administrator runs:
 
@@ -53,11 +66,7 @@ For a different name, set `$provision.DisplayName`, or pass `-Name 'MyAgentProvi
 | `Approve` | Authorize app/service-principal changes. Without it, the script stops after a basic preview; `WhatIf` performs directory reads without writes. |
 | `GrantAdminConsent` | Separately authorize tenant-wide delegated consent; requires appropriate administrator authority. |
 
-The script prints `applicationObjectId` and `clientId`. Copy the **client ID** into `.env`:
-
-```dotenv
-ENTRA_PROVISIONING_CLIENT_ID=<CLIENT-ID-PRINTED-BY-THE-SCRIPT>
-```
+The script prints `applicationObjectId` and `clientId`, and after verification writes `ENTRA_PROVISIONING_CLIENT_ID=<client ID>` to the repository `.env` (creating it if needed, replacing only that line, leaving other lines unchanged). Use `-EnvFile <path>` to write elsewhere. The client ID is not a secret.
 
 Rerun with the same name to reuse the registration; existing redirect URIs, API permissions, and consent scopes are preserved. If a later step fails or multiple registrations share the name, rerun with the printed `-ApplicationObjectId` to select the intended app. An unresolved creation must be reconciled in Entra rather than blindly repeated.
 
@@ -91,7 +100,7 @@ Browser sign-in uses MSAL authorization-code/PKCE, a 180-second timeout, an in-m
 
 Do **not** put provisioning Graph permissions on the child or host. The registered child uses the S2S path without an extra Observability permission/admin-consent step where service policy allows it. On rejection, diagnose registration/policy; do not automatically add `OtelWrite` or switch to delegated authentication.
 
-## Architecture and ID map
+## Reference: architecture and ID map
 
 ```text
 Authorized setup caller + public provisioning client
@@ -135,15 +144,15 @@ Agent identities are service-principal-only objects; the typed contract returns 
 
 The existing system identity remains useful and is explicitly selected with `ManagedIdentityCredential()` for hosted model access and Azure Monitor. The UAMI is the **documented blueprint-federation path chosen here**, not evidence that Agent 365 universally prohibits system identities. Do not configure global `AZURE_CLIENT_ID`; these scripts reject it to avoid credential ambiguity.
 
-## A. Run locally, then deploy a working agent
+## Step 2. Deploy the App Service
 
-From this repository root:
+First, optionally run the agent locally. From this repository root:
 
 ```powershell
 uv venv .venv --python 3.12
 uv pip install --python .venv\Scripts\python.exe `
   --index-url https://packagefeedproxy.microsoft.io/pypi/simple -r requirements-dev.txt
-Copy-Item .env.example .env
+if (!(Test-Path .env)) { Copy-Item .env.example .env }   # step 1 may already have created it
 az login --tenant '<TENANT-GUID>'
 ```
 
@@ -163,7 +172,7 @@ Invoke-RestMethod http://127.0.0.1:8000/chat -Method Post -ContentType applicati
 
 `GET /health` returns only `{"status":"ok"}`. `POST /chat` accepts a nonblank string up to 8,000 characters, and an optional 1-128 character correlation ID using letters/digits/`._:-`. Bodies over 40,000 bytes are rejected. The response has `reply`, `conversation_id`, and `trace_id` (`null` while tracing is disabled). Each call is **single turn**, even when a conversation ID is reused.
 
-Set real deployment values before running these commands:
+Then deploy with `scripts\deploy.ps1`. Set real deployment values before running these commands:
 
 ```powershell
 $deploy = @{
@@ -244,16 +253,15 @@ Hosted `/health` is protected too. Deployment/verification check that anonymous 
 
 Entra authentication is not rate limiting or a cost cap: every permitted tenant user can incur model charges. Production/multi-user deployments still need appropriate authorization, rate limiting, cost controls and abuse protection.
 
-### Talk to the deployed agent
+## Step 3. Talk to the deployed agent
 
 Open [00_talk_to_agent.ipynb](notebooks/00_talk_to_agent.ipynb), select this repository's `.venv` kernel, and run the cells. It uses saved deployment/authentication state and your Azure CLI identity to check health and send messages. It also works before a readiness artifact exists by reading `.local\http-auth.json` and looking up the app hostname; set `AGENT_URL` in the notebook to avoid that ARM lookup. Edit the message cell for each single-turn conversation. Health success does not prove model access; chat errors are reported separately. Model calls may incur charges. Clear conversation outputs before saving or sharing.
 
-## B. Register through the notebook
+## Step 4. Register with Agent 365 through the notebook
 
-Open [01_register_with_agent365.ipynb](notebooks/01_register_with_agent365.ipynb), select `.venv` and run sections in order. Add the notebook-only values to `.env` first:
+Open [01_register_with_agent365.ipynb](notebooks/01_register_with_agent365.ipynb), select `.venv` and run sections in order. `ENTRA_PROVISIONING_CLIENT_ID` was already written to `.env` by step 1. Add the other notebook-only values to `.env` first:
 
 ```dotenv
-ENTRA_PROVISIONING_CLIENT_ID=<CONSENTED-PUBLIC-CLIENT-GUID>
 ONBOARDING_SPONSOR_USER_ID=<EXISTING-HUMAN-SPONSOR-GUID>
 FOUNDRY_EXTERNAL_AGENT_NAME=AppServiceLearningAgentExternal
 APPLICATIONINSIGHTS_RESOURCE_ID=/subscriptions/<SUBSCRIPTION>/resourceGroups/<RG>/providers/Microsoft.Insights/components/<RESOURCE>
@@ -275,7 +283,7 @@ Back these up securely for retry/cleanup; do not share or commit them. State mus
 
 Rerun the notebook to demonstrate reuse of the same blueprint, principal, child, FIC and external version. Identity/registration readback is not proof of telemetry delivery.
 
-## C. Activate both destinations
+## Step 5. Activate both destinations
 
 Instrumentation is already in source; activation updates settings and restarts the app, not source files on the host. It rereads Azure identity attachments, Graph relationships/FIC/sponsor/registration, Foundry kind/version/telemetry ID, and the project-linked Insights destination. Settings are merged additively without printing values.
 
@@ -302,7 +310,7 @@ Operational logs stay with App Service logging; the pipeline exports activity sp
 
 The pinned distro's Azure Monitor path requires `OTEL_LOGS_EXPORTER=none` and `OTEL_METRICS_EXPORTER=none` to keep those signals off; initialization sets them explicitly. A small version-bound startup check inspects the installed provider's exporter shape because this distro can swallow exporter initialization errors. It refuses a missing/duplicate destination instead of silently downgrading dual export. Revalidate this check when updating dependencies. Conflicting OTLP settings or disabled trace export are rejected.
 
-## D. Invoke and verify each outcome
+## Step 6. Invoke and verify each outcome
 
 ```powershell
 .\scripts\verify.ps1 `

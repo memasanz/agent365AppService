@@ -8,7 +8,8 @@ Requires Microsoft.Graph.Authentication and an authorized app-registration admin
 -Approve authorizes application/service-principal configuration. -GrantAdminConsent separately
 authorizes tenant-wide delegated consent and requires an authorized consent administrator.
 Existing permissions, consent scopes, and redirect URIs are preserved. No credentials are created.
-The script prints the client ID to put in .env; it does not modify .env.
+After verification it sets only ENTRA_PROVISIONING_CLIENT_ID in -EnvFile (default: repository .env),
+creating the file if needed and leaving other lines unchanged.
 .EXAMPLE
 .\scripts\New-AgentIdentityProvisioningClient.ps1 -TenantId '<TENANT-GUID>' -WhatIf
 .EXAMPLE
@@ -23,6 +24,7 @@ param(
     [Parameter(Mandatory)][guid]$TenantId,
     [Alias('Name')][ValidateNotNullOrEmpty()][string]$DisplayName = 'Agent365IdentityProvisioner',
     [guid]$ApplicationObjectId = [guid]::Empty,
+    [string]$EnvFile = (Join-Path (Split-Path $PSScriptRoot -Parent) '.env'),
     [switch]$Approve,
     [switch]$GrantAdminConsent
 )
@@ -46,7 +48,7 @@ $permissions = @(
 )
 Write-Host "PREVIEW: create/reuse ordinary single-tenant public client '$DisplayName' in tenant $TenantId."
 Write-Host "Desktop redirect: $redirectUri. Delegated Microsoft Graph permissions: $($permissions -join ', ')."
-Write-Host "Admin consent explicitly authorized: $GrantAdminConsent. No secrets, agent identities, Azure roles, or App Service changes."
+Write-Host "Admin consent explicitly authorized: $GrantAdminConsent. No secrets, agent identities, Azure roles, or App Service changes. Client ID will be written to $EnvFile."
 if (!$Approve -and !$WhatIfPreference) {
     throw 'Preview only: rerun with -Approve, and -GrantAdminConsent only when authorized to grant consent.'
 }
@@ -194,7 +196,13 @@ if ($verifiedApp['appId'] -ne $clientId -or $verifiedApp['signInAudience'] -ne '
 }
 $verifiedPrincipal = Invoke-ProvisioningGraph 'GET' "$graphBase/servicePrincipals/$($clientPrincipal['id'])?`$select=id,appId"
 if ($verifiedPrincipal['appId'] -ne $clientId) { throw 'Service principal belongs to a different application.' }
-Write-Host "Verified. Set ENTRA_PROVISIONING_CLIENT_ID=$clientId in .env."
+$envLine = "ENTRA_PROVISIONING_CLIENT_ID=$clientId"
+$envLines = if (Test-Path -LiteralPath $EnvFile) { @(Get-Content -LiteralPath $EnvFile) } else { @() }
+if (@($envLines | Where-Object { $_ -match '^\s*ENTRA_PROVISIONING_CLIENT_ID\s*=' }).Count) {
+    $envLines = @($envLines | ForEach-Object { if ($_ -match '^\s*ENTRA_PROVISIONING_CLIENT_ID\s*=') { $envLine } else { $_ } })
+} else { $envLines += $envLine }
+Set-Content -LiteralPath $EnvFile -Value $envLines -Encoding utf8NoBOM
+Write-Host "Verified. Wrote $envLine to $EnvFile."
 if (!$GrantAdminConsent) { Write-Host 'Consent was not changed. An administrator must ensure the eight notebook scopes are consented before notebook sign-in.' }
 [pscustomobject]@{
     applicationObjectId = $applicationId

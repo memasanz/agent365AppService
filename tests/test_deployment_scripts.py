@@ -23,12 +23,15 @@ def powershell(script):
 
 
 @pytest.mark.parametrize("custom_name", [False, True])
-def test_provisioning_client_creation_reuse_and_consent_are_explicit(custom_name):
+def test_provisioning_client_creation_reuse_and_consent_are_explicit(custom_name, tmp_path):
     from src.onboarding import SCOPES
 
     root = str(ROOT).replace("'", "''")
+    env_file = tmp_path / ".env"
+    env_file.write_text("KEEP=1\nENTRA_PROVISIONING_CLIENT_ID=old\nOTHER=2\n", encoding="utf-8")
     name = "CustomAgentProvisioner" if custom_name else "Agent365IdentityProvisioner"
     name_argument = f"-Name '{name}'" if custom_name else ""
+    name_argument += f" -EnvFile '{str(env_file).replace(chr(39), chr(39) * 2)}'"
     permissions = [
         {"value": scope, "id": f"10000000-0000-0000-0000-{i:012d}", "isEnabled": True}
         for i, scope in enumerate(SCOPES, start=1)
@@ -197,6 +200,11 @@ def test_provisioning_client_creation_reuse_and_consent_are_explicit(custom_name
         if ($global:Writes -ne $before) {{ throw 'A failed preflight changed directory objects' }}
         Write-Output 'Provisioning regressions passed'
     """)
+    assert env_file.read_text(encoding="utf-8").splitlines() == [
+        "KEEP=1",
+        "ENTRA_PROVISIONING_CLIENT_ID=11111111-1111-1111-1111-111111111111",
+        "OTHER=2",
+    ]
 
 
 def test_powershell_scripts_parse_and_parameter_example_is_valid():
