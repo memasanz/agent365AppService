@@ -73,6 +73,26 @@ $provision = @{
 
 For a different name, set `$provision.DisplayName`, or pass `-Name 'MyAgentProvisioner'` (`Name` is an alias for `DisplayName`). If the caller cannot grant admin consent, omit `-GrantAdminConsent`; an authorized consent administrator must grant the permissions before notebook sign-in.
 
+Run all three commands in the **same PowerShell session**, because `@provision` expands the `$provision` variable. `-GrantAdminConsent` is for accounts that can grant tenant-wide consent (for example Privileged Role Administrator or Global Administrator).
+
+When you run the `-Approve` command:
+1. A browser sign-in opens. Approve the `Application.ReadWrite.All` prompt, plus `DelegatedPermissionGrant.ReadWrite.All` when `-GrantAdminConsent` is used.
+2. The script prints `applicationObjectId` and `clientId`.
+3. Confirm that `.env` now contains `ENTRA_PROVISIONING_CLIENT_ID=<clientId>`. Steps 2-4 depend on it.
+
+### What you are approving
+
+`-Approve` authorizes changes to **one app registration** in your tenant, plus one line in your local `.env`. Nothing else.
+
+| Switch | What it authorizes |
+| --- | --- |
+| *(none)* | Prints a preview and stops. Nothing is created and Graph is not contacted. |
+| `-WhatIf` | Signs in and reads the directory, then reports what it would do. No writes. |
+| `-Approve` | Creates, or reuses and updates, the single-tenant public client (default `Agent365IdentityProvisioner`). Adds the `http://localhost:8400` redirect and the eight delegated permissions as **requested** permissions only (no consent yet). Ensures its service principal exists. Writes `ENTRA_PROVISIONING_CLIENT_ID=<id>` to `.env`. |
+| `-Approve -GrantAdminConsent` | Everything above, plus **tenant-wide admin consent** for the eight permissions, for all users. Needs an admin role that can grant consent and the extra `DelegatedPermissionGrant.ReadWrite.All` sign-in scope. If you cannot grant consent, omit this and have an administrator consent in the portal. |
+
+Never done by this script: creating secrets, agent identities or blueprints, changing Azure roles, or touching the App Service. To undo, delete the app registration and the `.env` line. Reruns reuse an existing app of the same name rather than duplicating it.
+
 | Parameter | Purpose |
 | --- | --- |
 | `TenantId` | Required Entra tenant GUID. |

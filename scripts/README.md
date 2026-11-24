@@ -22,7 +22,7 @@ Safe-by-default conventions used by every script that changes something:
 
 Creates (or reuses) an ordinary single-tenant **public client** app registration named `Agent365IdentityProvisioner` (override with `-Name`/`-DisplayName`). Notebook 01 uses it to sign in. It is not a managed identity and is separate from the HTTP API registration.
 
-What it does, in order:
+What it does, in order (`-Approve` authorizes steps 2-6 and 8; `-GrantAdminConsent` additionally authorizes step 7; the README's "What you are approving" table summarizes this):
 
 1. Prints a preview. Without `-Approve` or `-WhatIf` it stops before connecting to Graph.
 2. Signs in to Microsoft Graph with `Application.ReadWrite.All` (plus `DelegatedPermissionGrant.ReadWrite.All` only with `-GrantAdminConsent`) and checks the tenant matches. These bootstrap permissions are not added to the new app.
