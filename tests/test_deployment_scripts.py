@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,6 +19,7 @@ def powershell(script):
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
 
 
 def test_powershell_scripts_parse_and_parameter_example_is_valid():
@@ -31,6 +33,126 @@ def test_powershell_scripts_parse_and_parameter_example_is_valid():
             if ($errors.Count) {{ throw 'PowerShell syntax error' }}
         }}
         Get-Content '{root}\\infra\\main.parameters.example.json' -Raw | ConvertFrom-Json | Out-Null
+    """)
+
+
+def test_artifacts_resolve_relative_to_powershell_location(tmp_path):
+    root = str(ROOT).replace("'", "''")
+    temp = str(tmp_path).replace("'", "''")
+    powershell(f"""
+        . '{root}\\scripts\\common.ps1'
+        Set-Location '{temp}'
+        $expected=Join-Path '{temp}' '.local\\artifact.json'
+        if ((Get-LocalPath '.local\\artifact.json') -ne $expected) {{
+            throw 'Artifact resolved against process cwd rather than PowerShell location'
+        }}
+        Write-ProtectedJson @{{verified=$true}} '.local\\artifact.json'
+        if (!(Read-JsonFile $expected).verified) {{ throw 'Relative artifact write failed' }}
+    """)
+
+
+@pytest.mark.parametrize("final_status", [3, 4])
+def test_source_build_waits_for_exact_deployment_and_detects_failure(deployment, final_status):
+    root = str(ROOT).replace("'", "''")
+    powershell(f"""
+        . '{root}\\scripts\\common.ps1'
+        $deployment='{json.dumps(deployment)}' | ConvertFrom-Json -AsHashtable
+        $script:Reads=0
+        $sourceId='{deployment["managedIdentityClientId"]}'
+        function Invoke-Az {{
+            param($Arguments,$Operation)
+            $script:Reads++
+            $status=if ($script:Reads -eq 1) {{ 1 }} else {{ {final_status} }}
+            return @(
+                @{{id='older-unrelated-deployment';status=4}}
+                @{{id='{deployment["managedIdentityClientId"]}';status=$status}}
+            )
+        }}
+        $failed=$false
+        try {{ Wait-SourceDeployment $deployment $sourceId -Attempts 2 -PollSeconds 0 }}
+        catch {{
+            if ($_.Exception.Message -notlike '*failed*') {{ throw }}
+            $failed=$true
+        }}
+        if ($script:Reads -ne 2 -or $failed -ne ${str(final_status == 3).lower()}) {{
+            throw 'Source build success/failure was not tied to the exact accepted deployment'
+        }}
+    """)
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("InternalSubscriptionIsOverQuotaForSku", "App Service quota is insufficient"),
+        ("AuthorizationFailed", "Check sign-in, permissions"),
+    ],
+)
+def test_cli_failure_explains_quota_without_exposing_payloads(code, expected):
+    root = str(ROOT).replace("'", "''")
+    powershell(f"""
+        . '{root}\\scripts\\common.ps1'
+        function az {{
+            $global:LASTEXITCODE=1
+            '{{"code":"{code}","message":"PRIVATE RESPONSE BODY AND TOKEN"}}'
+        }}
+        $message=$null
+        try {{
+            Invoke-Az -Arguments @('deployment','group','create') -Operation 'Infrastructure'
+        }} catch {{ $message=$_.Exception.Message }}
+        if (!$message -or !$message.Contains('{expected}')) {{
+            throw 'Missing safe failure explanation'
+        }}
+        if ($message.Contains('PRIVATE') -or $message.Contains('TOKEN')) {{
+            throw 'CLI response payload leaked'
+        }}
+    """)
+
+
+@pytest.mark.parametrize("matching_identity", [True, False])
+def test_identity_attachment_ignores_case_but_rejects_another_identity(
+    deployment, matching_identity
+):
+    root = str(ROOT).replace("'", "''")
+    attached = deployment["managedIdentityResourceId"].lower()
+    if not matching_identity:
+        attached += "-unrelated"
+    app = {
+        "identity": {
+            "principalId": deployment["systemAssignedPrincipalId"],
+            "tenantId": deployment["tenantId"],
+            "userAssignedIdentities": {attached: {}},
+        },
+        "properties": {"defaultHostName": deployment["hostname"]},
+    }
+    managed = {
+        "properties": {
+            "clientId": deployment["managedIdentityClientId"],
+            "principalId": deployment["managedIdentityPrincipalId"],
+            "tenantId": deployment["tenantId"],
+        }
+    }
+    expected_rejection = str(not matching_identity).lower()
+    powershell(f"""
+        . '{root}\\scripts\\common.ps1'
+        $script:Deployment='{json.dumps(deployment)}' | ConvertFrom-Json -AsHashtable
+        $script:App='{json.dumps(app)}' | ConvertFrom-Json -AsHashtable
+        $script:Managed='{json.dumps(managed)}' | ConvertFrom-Json -AsHashtable
+        function Assert-AzureContext {{}}
+        function Invoke-Az {{
+            param($Arguments, $Operation)
+            if ($Arguments[3] -eq $script:Deployment.webAppResourceId) {{ return $script:App }}
+            if ($Arguments[3] -eq $script:Deployment.managedIdentityResourceId) {{
+                return $script:Managed
+            }}
+            throw 'Unexpected mocked CLI operation'
+        }}
+        $rejected=$false
+        try {{ $null=Assert-Deployment $script:Deployment }}
+        catch {{
+            if ($_.Exception.Message -notlike '*does not match*') {{ throw }}
+            $rejected=$true
+        }}
+        if ($rejected -ne ${expected_rejection}) {{ throw 'Incorrect identity validation result' }}
     """)
 
 
@@ -50,7 +172,12 @@ def test_ip_role_and_settings_guards_without_cloud_calls(tmp_path):
         }})
         function Invoke-Az {{
             param($Arguments, [switch]$NoOutput, $Operation)
-            if ($Arguments[0] -eq 'role') {{ return $script:FakeAssignments }}
+            if ($Arguments[0] -eq 'role') {{
+                if ('--scope' -in $Arguments -and '--all' -in $Arguments) {{
+                    throw 'Azure CLI rejects --all with an explicit scope'
+                }}
+                return $script:FakeAssignments
+            }}
             if ($Arguments[0] -ne 'webapp' -or 'set' -notin $Arguments) {{
                 throw 'Unexpected mocked CLI operation'
             }}
@@ -79,5 +206,180 @@ def test_ip_role_and_settings_guards_without_cloud_calls(tmp_path):
         }}
         if (Test-Path -LiteralPath $script:SettingsPath) {{
             throw 'Temporary settings not cleaned up'
+        }}
+    """)
+
+
+@pytest.mark.parametrize("valid_readback", [True, False])
+def test_public_network_opens_only_after_tenant_authentication_readback(
+    tmp_path, deployment, valid_readback
+):
+    root = str(ROOT).replace("'", "''")
+    temp = str(tmp_path).replace("'", "''")
+    deployment["httpAuthClientId"] = deployment["managedIdentityClientId"]
+    valid = str(valid_readback).lower()
+    powershell(f"""
+        . '{root}\\scripts\\common.ps1'
+        $script:ProjectRoot='{temp}'
+        $deployment='{json.dumps(deployment)}' | ConvertFrom-Json -AsHashtable
+        $script:Opened=$false
+        function Invoke-Az {{
+            param($Arguments, [switch]$NoOutput, $Operation)
+            if ($Arguments[0] -eq 'rest' -and $Arguments[2] -eq 'put') {{
+                $index=[array]::IndexOf($Arguments,'--body')+1
+                $script:Payload=Get-Content $Arguments[$index].Substring(1) -Raw |
+                    ConvertFrom-Json -AsHashtable
+                return
+            }}
+            if ($Arguments[0] -eq 'rest' -and $Arguments[2] -eq 'get') {{
+                if (!${valid}) {{
+                    $script:Payload.properties.identityProviders.azureActiveDirectory.registration.
+                        openIdIssuer='https://login.microsoftonline.com/other-tenant/v2.0'
+                }}
+                return $script:Payload
+            }}
+            if ($Arguments[0] -ne 'webapp' -or 'Allow' -notin $Arguments) {{
+                throw 'Unexpected mocked CLI operation'
+            }}
+            $script:Opened=$true
+        }}
+        $failed=$false
+        try {{ Enable-PublicEntraAccess $deployment }} catch {{ $failed=$true }}
+        if ($script:Opened -ne ${valid} -or $failed -eq ${valid}) {{
+            throw 'Public networking was not gated on authentication validation'
+        }}
+        $policy=$script:Payload.properties.identityProviders.azureActiveDirectory.validation.
+            defaultAuthorizationPolicy
+        if ($policy.ContainsKey('allowedPrincipals')) {{ throw 'Unexpected per-user restriction' }}
+        if (Get-ChildItem '{temp}\\.local' -Filter '*.json') {{
+            throw 'Temporary auth settings were not removed'
+        }}
+    """)
+
+
+@pytest.mark.parametrize("authenticated", [True, False])
+def test_verification_uses_api_token_only_in_entra_mode(deployment, authenticated):
+    root = str(ROOT).replace("'", "''")
+    if authenticated:
+        deployment["httpAuthClientId"] = deployment["managedIdentityClientId"]
+    enabled = str(authenticated).lower()
+    scope = f"api://{deployment['managedIdentityClientId']}/user_impersonation"
+    stdout = powershell(f"""
+        . '{root}\\scripts\\common.ps1'
+        $deployment='{json.dumps(deployment)}' | ConvertFrom-Json -AsHashtable
+        function Invoke-Az {{
+            param($Arguments, $Operation)
+            if (!${enabled} -or $Arguments[0] -ne 'account' -or
+                $Arguments -notcontains '{scope}' -or
+                $Arguments -notcontains '{deployment["subscriptionId"]}' -or
+                $Arguments -contains '--tenant') {{
+                throw 'Unexpected token acquisition/scope'
+            }}
+            return @{{accessToken='PRIVATE_FAKE_TOKEN'}}
+        }}
+        function Invoke-WebRequest {{
+            param($Uri,$Headers,$Method,$ContentType,$Body,$TimeoutSec,$MaximumRedirection,
+                [switch]$SkipHttpErrorCheck)
+            if ($Uri.EndsWith('/chat')) {{
+                if ($Body -ne '{{}}' -or
+                    $Headers['Authorization'] -eq 'Bearer PRIVATE_FAKE_TOKEN') {{
+                    throw 'Anonymous rejection probe could invoke the model or send a real token'
+                }}
+                return [pscustomobject]@{{StatusCode=401}}
+            }}
+            if (${enabled} -and $Headers['Authorization'] -ne 'Bearer PRIVATE_FAKE_TOKEN') {{
+                throw 'Missing authenticated health header'
+            }}
+            if (!${enabled} -and $Headers.Count) {{ throw 'CIDR mode acquired credentials' }}
+            return [pscustomobject]@{{StatusCode=200}}
+        }}
+        function Invoke-RestMethod {{
+            param($Uri,$Headers,$Method,$ContentType,$Body,$TimeoutSec,$MaximumRedirection)
+            if (${enabled} -and $Headers['Authorization'] -ne 'Bearer PRIVATE_FAKE_TOKEN') {{
+                throw 'Missing authenticated chat header'
+            }}
+            $request=$Body | ConvertFrom-Json
+            return [pscustomobject]@{{
+                reply='ok';conversation_id=$request.conversation_id;trace_id=$null
+            }}
+        }}
+        Wait-AppHealth $deployment -Attempts 1
+        Assert-AnonymousChatBlocked $deployment
+        $null=Invoke-BaselineChat $deployment
+    """)
+    assert "PRIVATE_FAKE_TOKEN" not in stdout
+
+
+def test_http_api_setup_requires_approval_and_reuses_registration(tmp_path, deployment):
+    root = str(ROOT).replace("'", "''")
+    artifact = str(tmp_path / "http-auth.json").replace("'", "''")
+    account = json.dumps(
+        {"tenantId": deployment["tenantId"], "id": deployment["subscriptionId"], "state": "Enabled"}
+    )
+    powershell(f"""
+        $ErrorActionPreference='Stop'
+        $global:ApiApp=$null; $global:ApiPrincipal=$null; $global:CreateCount=0
+        function az {{
+            $global:LASTEXITCODE=0
+            if ($args[0] -eq 'account') {{
+                return '{account}'
+            }}
+            if ($args[0] -ne 'rest') {{ throw 'Unexpected mocked CLI command' }}
+            $url=$args[[array]::IndexOf($args,'--url')+1]
+            if ($args[2] -eq 'get') {{
+                if ($url -match '/applications/') {{
+                    return ($global:ApiApp | ConvertTo-Json -Depth 20 -Compress)
+                }}
+                $items=@()
+                if ($url -match '/applications\\?' -and $global:ApiApp) {{
+                    $items=@($global:ApiApp)
+                }}
+                if ($url -match '/servicePrincipals\\?' -and $global:ApiPrincipal) {{
+                    $items=@($global:ApiPrincipal)
+                }}
+                return (ConvertTo-Json -InputObject @{{value=$items}} -Depth 20 -Compress)
+            }}
+            $bodyPath=$args[[array]::IndexOf($args,'--body')+1].Substring(1)
+            $body=Get-Content $bodyPath -Raw | ConvertFrom-Json -AsHashtable
+            if ($args[2] -eq 'post') {{
+                if ($url.EndsWith('/servicePrincipals')) {{
+                    $global:ApiPrincipal=@{{id='{deployment["systemAssignedPrincipalId"]}'}}
+                    return ($global:ApiPrincipal | ConvertTo-Json -Compress)
+                }}
+                $global:CreateCount++
+                $global:ApiApp=$body
+                $global:ApiApp.id='{deployment["systemAssignedPrincipalId"]}'
+                $global:ApiApp.appId='{deployment["managedIdentityClientId"]}'
+                $global:ApiApp.api=$null
+                return ($global:ApiApp | ConvertTo-Json -Depth 20 -Compress)
+            }}
+            if ($args[2] -ne 'patch') {{ throw 'Unexpected Graph write' }}
+            if ($body.ContainsKey('requiredResourceAccess') -or
+                $body.ContainsKey('passwordCredentials')) {{
+                throw 'Unexpected Graph workload permissions or credentials'
+            }}
+            if ($body.api.ContainsKey('preAuthorizedApplications') -and !$global:ApiApp.api) {{
+                throw 'Scope must be persisted before it can be preauthorized'
+            }}
+            $global:ApiApp.api=$body.api
+            $global:ApiApp.identifierUris=$body.identifierUris
+        }}
+        $setup=@{{
+            TenantId='{deployment["tenantId"]}'; SubscriptionId='{deployment["subscriptionId"]}'
+            ResourceGroup='{deployment["resourceGroup"]}'; WebAppName='{deployment["webAppName"]}'
+            AuthFile='{artifact}'
+        }}
+        try {{ & '{root}\\scripts\\configure-http-auth.ps1' @setup }}
+        catch {{ if ($_.Exception.Message -notlike '*Preview only*') {{ throw }} }}
+        if ($global:CreateCount -or (Test-Path '{artifact}')) {{
+            throw 'Preview changed directory/state'
+        }}
+        & '{root}\\scripts\\configure-http-auth.ps1' @setup -Approve
+        $first=Get-Content '{artifact}' -Raw | ConvertFrom-Json
+        & '{root}\\scripts\\configure-http-auth.ps1' @setup -Approve
+        $second=Get-Content '{artifact}' -Raw | ConvertFrom-Json
+        if ($global:CreateCount -ne 1 -or $first.clientId -ne $second.clientId -or
+            $first.scopeId -ne $second.scopeId -or !$second.configured) {{
+            throw 'HTTP API registration was duplicated or not verified'
         }}
     """)

@@ -3,7 +3,7 @@
 .SYNOPSIS
 Send one permitted, billable model request and distinguish readbacks from telemetry delivery.
 .DESCRIPTION
-Network-allowlisted callers only; the conversation ID is correlation metadata, not authentication.
+Network-allowlisted or Entra-authenticated callers; conversation IDs are correlation metadata.
 Optional SettingsFile invokes administrative read-only Graph/Foundry validation, not portal checks.
 This script performs no Azure/Graph configuration writes.
 #>
@@ -15,14 +15,14 @@ param(
     [ValidateLength(1, 2000)][string]$Message = 'Explain what this sample agent does in one short sentence.'
 )
 . (Join-Path $PSScriptRoot 'common.ps1')
-$deployment = Read-JsonFile ([IO.Path]::GetFullPath($DeploymentFile))
+$deployment = Read-JsonFile (Get-LocalPath $DeploymentFile)
 $null = Assert-Deployment $deployment
 $current = Get-AppSettings $deployment
 if ($current.ContainsKey('AZURE_CLIENT_ID') -or $current['FOUNDRY_PROJECT_ENDPOINT'] -ne $deployment.foundryProjectEndpoint -or
     $current['FOUNDRY_MODEL'] -ne $deployment.modelDeployment) { throw 'Live model configuration does not match the deployment artifact or contains global AZURE_CLIENT_ID.' }
 $artifact = $null
 if ($SettingsFile) {
-    $SettingsFile = [IO.Path]::GetFullPath($SettingsFile)
+    $SettingsFile = Get-LocalPath $SettingsFile
     $artifact = Read-JsonFile $SettingsFile
     if ($artifact['schemaVersion'] -ne 1 -or $artifact['deployment'] -isnot [hashtable]) { throw 'Invalid runtime settings artifact.' }
     foreach ($key in $deployment.Keys) {
@@ -43,8 +43,9 @@ if ($SettingsFile) {
     if ($Agent365Only) { throw '-Agent365Only requires -SettingsFile so the explicit opt-out can be checked.' }
     Write-Host 'Agent 365 and Foundry registration readback: NOT CHECKED (supply -SettingsFile after onboarding).'
 }
-Wait-AppHealth $deployment.hostname
-$response = Invoke-BaselineChat $deployment.hostname $Message
+Wait-AppHealth $deployment
+Assert-AnonymousChatBlocked $deployment
+$response = Invoke-BaselineChat $deployment $Message
 if ($current['ENABLE_AGENT365_TELEMETRY'] -ne 'true') {
     Write-Host 'Telemetry: DISABLED. Baseline deployment/model succeeded; neither activity exporter is expected to run.'
     return

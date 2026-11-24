@@ -1,7 +1,7 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-Preview and explicitly approve a CIDR-restricted Linux App Service source deployment.
+Preview and explicitly approve a CIDR-restricted or Entra-authenticated Linux App Service deployment.
 .DESCRIPTION
 Uses an existing Foundry account/project/model; does not create or alter them. -Approve
 authorizes the displayed billable infrastructure/configuration/source changes, not RBAC.
@@ -18,8 +18,9 @@ param(
     [Parameter(Mandatory)][string]$FoundryProjectEndpoint,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ModelDeployment,
     [Parameter(Mandatory)][string]$ModelAccessScope,
-    [Parameter(Mandatory)][string[]]$CallerCidrs,
-    [Parameter(Mandatory)][string[]]$ScmCallerCidrs,
+    [string[]]$CallerCidrs = @(),
+    [string[]]$ScmCallerCidrs = @(),
+    [string]$HttpAuthFile,
     [ValidateSet('B1', 'S1', 'P1v3')][string]$Sku = 'B1',
     [ValidatePattern('^[a-zA-Z0-9-]+$')][string]$PlanName = "$WebAppName-plan",
     [ValidatePattern('^[a-zA-Z0-9-]+$')][string]$ManagedIdentityName = "$WebAppName-blueprint-mi",
@@ -32,8 +33,21 @@ $cliVersion = Invoke-Az -Arguments @('version') -Operation 'Azure CLI version ch
 if ([version]$cliVersion['azure-cli'] -lt [version]'2.48.1') { throw 'Azure CLI 2.48.1 or later is required for Entra-authenticated ZIP deployment with SCM basic authentication disabled.' }
 Assert-AzureContext $TenantId $SubscriptionId
 Assert-ProjectEndpoint $FoundryProjectEndpoint
-Assert-Cidrs $CallerCidrs 'CallerCidrs'
-Assert-Cidrs $ScmCallerCidrs 'ScmCallerCidrs'
+$httpAuth = $null
+if ($HttpAuthFile) {
+    $httpAuth = Read-JsonFile (Get-LocalPath $HttpAuthFile)
+    $expectedSite = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Web/sites/$WebAppName"
+    if ($httpAuth['schemaVersion'] -ne 1 -or $httpAuth['configured'] -ne $true -or
+        $httpAuth.tenantId -ne $TenantId -or $httpAuth.subscriptionId -ne $SubscriptionId -or $httpAuth.webAppResourceId -ne $expectedSite) {
+        throw 'HTTP authentication artifact is unverified or belongs to another tenant/deployment.'
+    }
+    Assert-HttpAuthRegistration $httpAuth
+    $CallerCidrs = @()
+    $ScmCallerCidrs = @()
+} else {
+    Assert-Cidrs $CallerCidrs 'CallerCidrs'
+    Assert-Cidrs $ScmCallerCidrs 'ScmCallerCidrs'
+}
 
 if ($ModelAccessScope -notmatch '^/subscriptions/([0-9a-f-]{36})/resourceGroups/[^/]+/providers/Microsoft.CognitiveServices/accounts/[^/]+$') {
     throw 'ModelAccessScope must be the exact existing Microsoft.CognitiveServices/accounts resource ID, not a subscription, resource group, project, or deployment.'
@@ -93,8 +107,13 @@ try {
     Write-ProtectedJson $parameters $parameterPath
     Write-Host "PREVIEW: tenant $TenantId; subscription $SubscriptionId; resource group $ResourceGroup ($Location)."
     Write-Host "Create/update Linux plan '$PlanName' ($Sku, one worker), Python 3.12 app '$WebAppName', dedicated UAMI '$ManagedIdentityName', both app identities, HTTPS/TLS, disabled basic publishing."
-    Write-Host "Caller allowlist: $($CallerCidrs -join ', '); independent SCM deployment allowlist: $($ScmCallerCidrs -join ', '); unmatched traffic DENIED on both."
-    Write-Host 'The current deployment machine must be in BOTH applicable allowlists. CIDRs restrict networks, not individual users.'
+    if ($httpAuth) {
+        Write-Host 'PUBLIC ENTRA MODE: ignore supplied CIDRs. Keep networking denied until mandatory single-tenant bearer authentication is configured/read back; then open site/SCM networking.'
+        Write-Host 'Every tenant user may call through Azure CLI with an API access token. SCM still requires Entra deployment RBAC; basic publishing stays disabled.'
+    } else {
+        Write-Host "Caller allowlist: $($CallerCidrs -join ', '); independent SCM deployment allowlist: $($ScmCallerCidrs -join ', '); unmatched traffic DENIED on both."
+        Write-Host 'The current deployment machine must be in BOTH applicable allowlists. CIDRs restrict networks, not individual users.'
+    }
     Write-Host 'Additive baseline settings reset telemetry OFF; deploy only requirements.txt + src Python files; restart; perform one billable model call.'
     Write-Host "RBAC creation explicitly authorized: $AssignModelRole (Cognitive Services OpenAI User only, at supplied account)."
     Write-Host 'COSTS: App Service plan bills continuously, including while idle; existing plan SKU/capacity changes affect every hosted app. Model calls consume quota and incur usage charges. Telemetry ingestion may incur charges only after later activation.'
@@ -108,6 +127,11 @@ try {
     }
     if (!$Approve -and !$WhatIfPreference) { throw 'Preview only: rerun with -Approve to authorize the described cloud changes (and -AssignModelRole only if authorized for RBAC).' }
     if (!$PSCmdlet.ShouldProcess($siteId, 'Apply billable infrastructure, merge baseline settings, deploy source, and invoke one model request')) { return }
+    if ($httpAuth) {
+        $null = Get-CallerHeaders @{
+            tenantId = $TenantId; subscriptionId = $SubscriptionId; httpAuthClientId = $httpAuth.clientId
+        }
+    }
     if (!$groupExists) {
         Invoke-Az -Arguments @('group', 'create', '--name', $ResourceGroup, '--location', $Location, '--subscription', $SubscriptionId) -NoOutput -Operation 'Resource group creation'
     }
@@ -119,6 +143,10 @@ try {
     $deployment.foundryProjectEndpoint = $FoundryProjectEndpoint.TrimEnd('/')
     $deployment.modelDeployment = $ModelDeployment
     $deployment.modelAccessScope = $ModelAccessScope
+    if ($httpAuth) {
+        $deployment.httpAuthClientId = $httpAuth.clientId
+        Enable-PublicEntraAccess $deployment
+    }
     $null = Assert-Deployment $deployment
     if ($existingPrincipal -and $deployment.systemAssignedPrincipalId -ne $existingPrincipal) {
         throw 'System-assigned identity changed unexpectedly. Stop and investigate; do not recreate or delete existing role assignments.'
@@ -156,18 +184,25 @@ try {
             $null = [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $relative, [IO.Compression.CompressionLevel]::Optimal)
         }
     } finally { $archive.Dispose() }
+    Write-Host 'Allowing configuration-triggered SCM restarts to settle before uploading source.'
+    Start-Sleep -Seconds 60
     # Current az webapp deploy uses Entra authentication when SCM basic authentication is disabled.
-    Invoke-Az -Arguments @('webapp', 'deploy', '--resource-group', $ResourceGroup, '--name', $WebAppName, '--subscription', $SubscriptionId,
-        '--src-path', $zipPath, '--type', 'zip', '--async', 'false', '--track-status', 'true', '--timeout', '1200000', '--restart', 'true') -NoOutput -Operation 'Entra-authenticated Oryx ZIP deployment'
+    $source = Invoke-Az -Arguments @('webapp', 'deploy', '--resource-group', $ResourceGroup, '--name', $WebAppName, '--subscription', $SubscriptionId,
+        '--src-path', $zipPath, '--type', 'zip', '--async', 'true', '--track-status', 'false', '--timeout', '1200000', '--restart', 'true') -Operation 'Entra-authenticated asynchronous Oryx ZIP deployment'
+    $sourceId = ([string]$source['id']).TrimEnd('/').Split('/')[-1]
+    Assert-Guid $sourceId 'accepted source deployment ID'
+    Write-Host "Source upload accepted as $sourceId. Poll this deployment rather than hold a long-lived build request."
+    Wait-SourceDeployment $deployment $sourceId
     $null = Assert-Deployment $deployment
     $actualSettings = Get-AppSettings $deployment
     if ($actualSettings['ENABLE_AGENT365_TELEMETRY'] -ne 'false' -or $actualSettings.ContainsKey('AZURE_CLIENT_ID') -or
         $actualSettings['FOUNDRY_PROJECT_ENDPOINT'] -ne $deployment.foundryProjectEndpoint -or $actualSettings['FOUNDRY_MODEL'] -ne $ModelDeployment) {
         throw 'Baseline settings readback failed; no readiness artifact written.'
     }
-    Wait-AppHealth $deployment.hostname
-    $null = Invoke-BaselineChat $deployment.hostname
-    Write-ProtectedJson $deployment ([IO.Path]::GetFullPath($DeploymentFile))
+    Wait-AppHealth $deployment
+    Assert-AnonymousChatBlocked $deployment
+    $null = Invoke-BaselineChat $deployment
+    Write-ProtectedJson $deployment (Get-LocalPath $DeploymentFile)
     Write-Host "Baseline verified; both activity exporters dormant. Deployment artifact: $DeploymentFile"
     $deployment | ConvertTo-Json -Depth 5 | Write-Host
     Write-Host 'Next: run the onboarding notebook using this verified deployment artifact.'

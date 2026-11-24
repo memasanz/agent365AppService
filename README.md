@@ -9,14 +9,16 @@ This is a single-turn educational sample, not a production public API. No fronte
 - PowerShell **7+**, Git, Azure CLI with Bicep, `uv`, Python 3.12, and VS Code Python/Jupyter support.
 - An Azure subscription and permission to create a Linux App Service plan, web app and user-assigned managed identity (UAMI).
 - An existing commercial-cloud Foundry project and **Responses-compatible** model deployment. `FOUNDRY_MODEL` is the deployment name. Identify its Cognitive Services account ARM scope.
-- An explicit caller public IP/CIDR and deployment-machine public IP/CIDR. The learning deployment restricts both site and SCM independently with unmatched traffic denied. An IP allowlist is **network restriction, not user authentication**.
+- Either explicit caller/deployment CIDRs, or the **public Entra-authenticated mode** below. Default deployment restricts site and SCM independently. An IP allowlist is **network restriction, not user authentication**.
 - For the default dual-destination walkthrough: an existing **Application Insights resource linked to the selected Foundry project**. This starter does not create shared Foundry/model/Insights resources.
 
 **Charges:** App Service B1 is billable while provisioned, including idle time. Model calls, Application Insights ingestion/retention, applicable Agent 365 licensing, and network traffic can incur charges. Prices and capacity depend on region/subscription. Deployment describes changes and requires `-Approve`; role creation requires its own explicit switch. Nothing in local setup/tests provisions Azure resources.
 
-### Administrative permissions (outside the app)
+### Agent 365 notebook administrative permissions (not HTTP Easy Auth)
 
-Ask an authorized tenant administrator to configure a dedicated **single-tenant public provisioning client**, with Mobile and desktop redirect **`http://localhost:8400`**, appropriate public-client configuration, and explicit admin consent to these **delegated Microsoft Graph** permissions. Consent and caller authority are separate prerequisites; neither is granted by the notebook.
+The following provisioning client is only for the later Agent 365 onboarding notebook. It is separate from the HTTP API registration used by Easy Auth; deploying and calling the app does not require this desktop redirect.
+
+For notebook onboarding, ask an authorized tenant administrator to configure a dedicated **single-tenant public provisioning client**, with Mobile and desktop redirect **`http://localhost:8400`**, appropriate public-client configuration, and explicit admin consent to these **delegated Microsoft Graph** permissions. Consent and caller authority are separate prerequisites; neither is granted by the notebook.
 
 | Operation | Requested least-privilege delegated permissions |
 | --- | --- |
@@ -144,11 +146,64 @@ $deploy = @{
 .\scripts\verify.ps1 -DeploymentFile .\.local\deployment.json
 ```
 
-Missing model access without the role switch prints a precise administrator command and stops. Deployment uses Bicep plus supported App Service ZIP/OneDeploy and remote Oryx build; the archive contains runtime source and locked requirements, not `.env`, notebooks, `.venv` or setup state. Existing system principal, role assignments, attached identities and unrelated app settings are preserved. Infrastructure-owned startup/runtime/access settings are intentionally reapplied. Redeploying deliberately disables telemetry again; reactivate after onboarding.
+Missing model access without the role switch prints a precise administrator command and stops. Deployment uses Bicep plus supported App Service ZIP/OneDeploy and remote Oryx build; the archive contains runtime source and locked requirements, not `.env`, notebooks, `.venv` or setup state. Source upload is asynchronous, followed by bounded polling of the exact accepted deployment ID, so a long Oryx build does not depend on one long-lived HTTP response. Existing system principal, role assignments, attached identities and unrelated app settings are preserved. Infrastructure-owned startup/runtime/access settings are intentionally reapplied. Redeploying deliberately disables telemetry again; reactivate after onboarding.
 
 **Do not proceed to onboarding until the hosted agent answers a real prompt.** Health alone does not test model authorization. If your IP changes, rerun with the revised explicit CIDR arrays, reviewing restrictions before approval. Update SCM separately when the deployment source changes. Do not use `0.0.0.0/0` or copy site restrictions blindly onto SCM.
 
-For multi-user/public use, add real authentication, per-user authorization, rate limiting, cost controls and abuse protection; IP restrictions do not supply those.
+### Alternative: public networking with Microsoft Entra authentication
+
+Use this mode when your network has rotating or destination-specific outbound IPs. A generic IP lookup can report a different address from the one Azure sees; a blocked App Service request reports its observed address in `x-ms-forbidden-ip`. Do not keep adding rotating proxy IPs or use an unrestricted anonymous `/chat`.
+
+This mode uses **App Service built-in authentication**, not custom JWT validation. Every authenticated user in the deployment's tenant may call the API through Azure CLI, subject to tenant policy; there is no individual-user allowlist. Anonymous requests and other issuers/audiences are rejected. Azure CLI is the configured public client; other client applications require a reviewed configuration change.
+
+The setup caller must be permitted to create/manage an ordinary single-tenant app registration and its service principal. This registration is **separate from the Agent 365 blueprint/provisioning client**. It exposes only this API's `user_impersonation` scope and preauthorizes Azure CLI for that scope; it requests no Microsoft Graph workload permissions and creates no client secret. This is a bearer-token API: it does not add a browser sign-in frontend or an implicit-flow login.
+
+After defining `$deploy` above:
+
+```powershell
+.\scripts\configure-http-auth.ps1 `
+  -TenantId $deploy.TenantId -SubscriptionId $deploy.SubscriptionId `
+  -ResourceGroup $deploy.ResourceGroup -WebAppName $deploy.WebAppName -WhatIf
+
+# Explicit approval for the dedicated API application, principal, and own-API preauthorization.
+.\scripts\configure-http-auth.ps1 `
+  -TenantId $deploy.TenantId -SubscriptionId $deploy.SubscriptionId `
+  -ResourceGroup $deploy.ResourceGroup -WebAppName $deploy.WebAppName -Approve
+
+$deploy.HttpAuthFile = '.\.local\http-auth.json'
+.\scripts\deploy.ps1 @deploy -Approve -AssignModelRole
+.\scripts\verify.ps1 -DeploymentFile .\.local\deployment.json
+```
+
+With `HttpAuthFile`, supplied CIDRs are intentionally ignored. Infrastructure first denies network access; the script configures and reads back mandatory tenant-specific HTTPS authentication, then opens site/SCM networking. SCM still requires Entra deployment RBAC and keeps basic publishing disabled. Use `HttpAuthFile` on every redeployment; otherwise the original CIDR requirements apply.
+
+For repeat deployments, keep the same parameters and protected `.local` state, and rerun `deploy.ps1` with the same switches. API setup reuses its saved registration. If you delete only the App Service and recreate it with the same name, its system-assigned principal changes: include `-AssignModelRole` so the new principal receives model access (the caller must have permission to grant it). Deleting the app is not necessary for normal redeployment. The script waits for configuration-triggered restarts before uploading source and does not report readiness until build and request checks succeed.
+
+Deployment saves the API client ID in its protected artifact. Verification and activation automatically acquire caller tokens for that API; those tokens are unrelated to the managed-identity model/telemetry tokens. No bearer values are printed or saved. If token acquisition needs fresh consent/sign-in, the script prints the exact `az login --tenant ... --scope ...` command.
+
+Public-mode deployment checks that a caller token can be acquired before changing Azure resources, so a missing initial API-scoped sign-in stops early rather than after a build.
+
+For a manual authenticated call:
+
+```powershell
+$d = Get-Content .\.local\deployment.json -Raw | ConvertFrom-Json
+$token = az account get-access-token --tenant $d.tenantId `
+  --scope "api://$($d.httpAuthClientId)/user_impersonation" --query accessToken -o tsv
+$headers = @{ Authorization = "Bearer $token" }
+Invoke-RestMethod "https://$($d.hostname)/chat" -Method Post `
+  -Headers $headers -ContentType application/json `
+  -Body (@{ message = 'Hello' } | ConvertTo-Json)
+$token = $null
+$headers.Clear()
+```
+
+Hosted `/health` is protected too. Deployment/verification check that anonymous and invalid-token `POST /chat` requests return **401**, then make one authenticated model request. Local development remains unchanged and is loopback-only by default.
+
+Entra authentication is not rate limiting or a cost cap: every permitted tenant user can incur model charges. Production/multi-user deployments still need appropriate authorization, rate limiting, cost controls and abuse protection.
+
+### Talk to the deployed agent
+
+Open [00_talk_to_agent.ipynb](notebooks/00_talk_to_agent.ipynb), select this repository's `.venv` kernel, and run the cells. It uses saved deployment/authentication state and your Azure CLI identity to check health and send messages. It also works before a readiness artifact exists by reading `.local\http-auth.json` and looking up the app hostname; set `AGENT_URL` in the notebook to avoid that ARM lookup. Edit the message cell for each single-turn conversation. Health success does not prove model access; chat errors are reported separately. Model calls may incur charges. Clear conversation outputs before saving or sharing.
 
 ## B. Register through the notebook
 
@@ -169,6 +224,7 @@ Obtain the connection string from Foundry **Manage > Project details > Connected
 Ignored, access-restricted artifacts:
 
 - `.local\deployment.json`: deployed host/identity/model outputs.
+- `.local\http-auth.json`: optional HTTP API application/principal IDs, scope and retry state; no credentials.
 - `.local\onboarding-state.json`: identity IDs, ownership/creation flags, retry intent, sponsor metadata, registration and Foundry ID/version.
 - `.local\runtime-settings.json`: activation settings, sponsor metadata and Insights destination configuration.
 
@@ -244,8 +300,12 @@ Workspace-context equivalents are `AppDependencies`/`AppRequests`, `TimeGenerate
 
 | Symptom | Check / action |
 | --- | --- |
+| Infrastructure rejected with insufficient App Service quota | Azure Portal **Quotas > App Service**: request instance quota for the selected SKU/region (for B1, at least 1). Region/SKU changes require a deliberate choice; the script never upgrades or moves the app automatically. |
 | Hosted `/chat` fails, health succeeds | System identity model role/account scope, model deployment/Responses support, endpoint/network; not blueprint permissions |
 | Caller/SCM gets 403 | Correct public IP/CIDR and separate site/SCM restrictions; allowlisting is not sign-in |
+| IP lookup matches allowlist but Azure denies access | Inspect `x-ms-forbidden-ip`; corporate routing can use rotating/destination-specific egress. Use approved fixed egress/ranges, or explicitly select public Entra mode above. |
+| Public Entra API returns 401/403 | Obtain a token for the saved **HTTP API audience**, from the configured tenant through Azure CLI. ARM/Graph/model tokens are not interchangeable. Follow the printed scoped-login command when needed. |
+| ZIP upload reports 502 or a build wait expires | Inspect `az webapp log deployment list/show` first: the server may still be building. Reconcile/wait on the accepted deployment ID rather than uploading a duplicate. |
 | FIC mismatch / blueprint FMI failure | Issuer tenant, exact UAMI **principal ID** subject, audience; runtime selects UAMI **client ID** |
 | Graph 401/403 or unsupported preview | Provisioning client consent, caller ownership/role, tenant eligibility and current contract; do not treat as not-found or elevate automatically |
 | Registration ambiguous/conflict | Preserve request ID/state; read back the existing registration and reconcile, never create another child |
@@ -281,7 +341,7 @@ az webapp delete --ids $d.webAppResourceId
 # Delete the named sample plan/UAMI separately only after checking no shared usage.
 ```
 
-An authorized administrator can remove a **sample-created** Agent 365 record using `DELETE /beta/copilot/agentRegistrations/{registrationId}`, and a sample-created Foundry external record with `project.agents.delete(agent_name=external_name)` in the recorded project. Remove only this sample's FIC by its saved ID; remove the child service principal and then blueprint/principal **only when sample-created and unused**. Deletion requires separately consented operation-specific delete/credential permissions (for example `AgentIdentity.DeleteRestore.All` for child deletion and appropriate blueprint delete rights); the default setup client is intentionally not an automatic cleanup superuser. Never delete reused/shared identities, Foundry projects/models or Application Insights. Delete protected local artifacts only after service-side cleanup/reconciliation is complete.
+An authorized administrator can remove a **sample-created** Agent 365 record using `DELETE /beta/copilot/agentRegistrations/{registrationId}`, and a sample-created Foundry external record with `project.agents.delete(agent_name=external_name)` in the recorded project. Remove only this sample's FIC by its saved ID; remove the child service principal and then blueprint/principal **only when sample-created and unused**. For optional HTTP authentication, inspect `.local\http-auth.json` and remove its dedicated API application/principal only when sample-created and unused; never delete a shared API registration. Deletion requires separately consented operation-specific delete/credential permissions (for example `AgentIdentity.DeleteRestore.All` for child deletion and appropriate blueprint delete rights); the default setup client is intentionally not an automatic cleanup superuser. Never delete reused/shared identities, Foundry projects/models or Application Insights. Delete protected local artifacts only after service-side cleanup/reconciliation is complete.
 
 ## Local validation and API references
 
@@ -311,6 +371,7 @@ Checked on **2026-11-23**: Agent Framework core 1.26.0 / Foundry 1.16.2 / OpenAI
 - [Microsoft registration contract source](https://github.com/microsoft/Agent365-devTools/blob/main/scripts/bulk-agent-registration/New-A365AgentRegistration.ps1)
 - [Foundry External Agents, roles and trace binding](https://learn.microsoft.com/azure/foundry/agents/how-to/register-external-agent)
 - [App Service agent identity context](https://learn.microsoft.com/azure/app-service/overview-agent-identity)
+- [App Service Entra authentication and built-in issuer/audience/client checks](https://learn.microsoft.com/azure/app-service/configure-authentication-provider-aad)
 - [Managed identity as federated credential](https://learn.microsoft.com/entra/workload-id/workload-identity-federation-config-app-trust-managed-identity)
 
 The sibling notebook examples in `agent_365_sdk` informed the identity/FMI pattern. This starter intentionally omits their secret/OBO/tools paths, makes Foundry External Agent registration mandatory for default dual export, and separates deployment, onboarding and runtime activation.

@@ -16,8 +16,8 @@ param(
     [switch]$Approve
 )
 . (Join-Path $PSScriptRoot 'common.ps1')
-$DeploymentFile = [IO.Path]::GetFullPath($DeploymentFile)
-$SettingsFile = [IO.Path]::GetFullPath($SettingsFile)
+$DeploymentFile = Get-LocalPath $DeploymentFile
+$SettingsFile = Get-LocalPath $SettingsFile
 $deployment = Read-JsonFile $DeploymentFile
 $artifact = Read-JsonFile $SettingsFile
 $null = Assert-Deployment $deployment
@@ -115,7 +115,7 @@ foreach ($name in $current.Keys) {
 }
 Invoke-Az -Arguments @('webapp', 'restart', '--resource-group', $deployment.resourceGroup, '--name', $deployment.webAppName,
     '--subscription', $deployment.subscriptionId) -NoOutput -Operation 'App Service restart'
-Wait-AppHealth $deployment.hostname
+Wait-AppHealth $deployment
 Write-Host 'Configuration enabled and health verified. This is not proof of token acquisition, accepted export, or portal visibility.'
 $modeFlag = if ($Agent365Only) { ' -Agent365Only' } else { '' }
 Write-Host "Next: .\scripts\verify.ps1 -DeploymentFile '$DeploymentFile' -SettingsFile '$SettingsFile'$modeFlag"

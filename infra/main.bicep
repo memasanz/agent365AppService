@@ -20,7 +20,7 @@ param scmCallerCidrs array = []
 @description('Existing attached UAMI resource IDs, obtained by deploy.ps1 to avoid detaching unrelated identities.')
 param existingUserAssignedIdentityIds array = []
 
-var retainedIdentities = toObject(existingUserAssignedIdentityIds, id => id, id => {})
+var retainedIdentities = toObject(existingUserAssignedIdentityIds, id => toLower(id), id => {})
 
 resource telemetryIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: managedIdentityName
@@ -52,7 +52,7 @@ resource webApp 'Microsoft.Web/sites@2025-03-01' = {
   identity: {
     type: 'SystemAssigned, UserAssigned'
     userAssignedIdentities: union(retainedIdentities, {
-      '${telemetryIdentity.id}': {}
+      '${toLower(telemetryIdentity.id)}': {}
     })
   }
   properties: {
