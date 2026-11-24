@@ -15,7 +15,7 @@ This is a single-turn educational sample, not a production public API. No fronte
 | 5 | Activate telemetry for both destinations. | `scripts\enable-observability.ps1` |
 | 6 | Invoke the agent and verify the traces. | Steps below |
 
-Steps 1 and 2 are independent; do both before step 4. Do not start step 4 until step 3 gets a real model reply. [scripts\README.md](scripts/README.md) describes each script and its functions.
+Steps 1 and 2 are independent; do both before step 4. Do not start step 4 until step 3 gets a real model reply. [scripts\README.md](scripts/README.md) describes each script and its functions; [src\README.md](src/README.md) documents the application code in depth for re-implementation.
 
 ## Prerequisites and costs
 
@@ -24,6 +24,21 @@ Steps 1 and 2 are independent; do both before step 4. Do not start step 4 until 
 - An existing commercial-cloud Foundry project and **Responses-compatible** model deployment. `FOUNDRY_MODEL` is the deployment name. Identify its Cognitive Services account ARM scope.
 - Either explicit caller/deployment CIDRs, or the **public Entra-authenticated mode** below. Default deployment restricts site and SCM independently. An IP allowlist is **network restriction, not user authentication**.
 - For the default dual-destination walkthrough: an existing **Application Insights resource linked to the selected Foundry project**. This starter does not create shared Foundry/model/Insights resources.
+
+### Permissions needed per step
+
+Each step needs a different person or role. Nothing is granted automatically; every role assignment and consent is behind an explicit switch.
+
+| Step | What runs | Who / permission needed |
+| --- | --- | --- |
+| 1. Provisioning script | `New-AgentIdentityProvisioningClient.ps1` | Entra role that can create app registrations (Application Developer, Cloud Application Administrator, or Application Administrator). Sign-in uses Graph `Application.ReadWrite.All`. With `-GrantAdminConsent` it also needs `DelegatedPermissionGrant.ReadWrite.All` and an admin role that can grant tenant-wide consent (Privileged Role Administrator or Global Administrator). Without that switch, an administrator grants consent in the portal. The bootstrap permissions are not added to the new app. |
+| 2. Deploy | `deploy.ps1`, `configure-http-auth.ps1`, `verify.ps1` | Azure: Contributor (or equivalent) on the target resource group or subscription to create the plan, web app and UAMI. With `-AssignModelRole`: Owner or User Access Administrator (role-assignment write) at the model account scope, to grant **Cognitive Services OpenAI User** to the app's system-assigned identity. Public mode (`configure-http-auth.ps1`) also needs Entra rights to create the API app registration and service principal. |
+| 3. Talk to the agent | Notebook 00 | Your `az login` identity needs access to call the app (Entra sign-in in public mode, or an allowed IP). The **app's** identity needs model access on the Foundry project; if chat returns a sanitized 502, check the app identity's role on the Foundry account and project first. |
+| 4. Register with Agent 365 | Notebook 01 | Tenant eligibility for Agent ID / Agent 365 (license, preview access, accepted terms). You sign in to the provisioning client from step 1 as a user who is a sponsor-eligible person in the tenant. The eight delegated Graph permissions must be admin-consented (see `SCOPES` in `src\onboarding.py`) and your user needs a directory role that allows creating agent blueprints and identities. The notebook never adds consent or elevates your role. Azure CLI reader access to the web app, UAMI and Foundry project is also needed for verification. |
+| 5. Activate telemetry | `enable-observability.ps1` | Contributor on the web app to change settings. With `-AssignMonitoringRole`: role-assignment write on the linked Application Insights, to grant **Monitoring Metrics Publisher** to the app's system-assigned identity. |
+| 6. Verify | `verify.ps1`, `validate-runtime` | Read access to the web app and, for the Graph readback, the read scopes from the provisioning client. |
+
+The hosted app itself holds **no Graph permissions**. At runtime it uses its system-assigned identity for the model (and Azure Monitor) and its UAMI only to start the federated Agent 365 token exchange.
 
 **Charges:** App Service B1 is billable while provisioned, including idle time. Model calls, Application Insights ingestion/retention, applicable Agent 365 licensing, and network traffic can incur charges. Prices and capacity depend on region/subscription. Deployment describes changes and requires `-Approve`; role creation requires its own explicit switch. Nothing in local setup/tests provisions Azure resources.
 
