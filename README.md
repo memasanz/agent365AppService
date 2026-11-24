@@ -20,6 +20,49 @@ The following provisioning client is only for the later Agent 365 onboarding not
 
 For notebook onboarding, ask an authorized tenant administrator to configure a dedicated **single-tenant public provisioning client**, with Mobile and desktop redirect **`http://localhost:8400`**, appropriate public-client configuration, and explicit admin consent to these **delegated Microsoft Graph** permissions. Consent and caller authority are separate prerequisites; neither is granted by the notebook.
 
+#### Create the notebook provisioning app registration
+
+Use `scripts\New-AgentIdentityProvisioningClient.ps1`. Its default display name is **`Agent365IdentityProvisioner`**: this is an administrative sign-in client, not the UAMI or the HTTP Easy Auth API registration. The script creates/reuses the ordinary app and its service principal, configures the desktop redirect and all eight delegated permissions below, and verifies the result. It creates no secrets and does not change App Service or `.env`.
+
+From this repository root, an authorized administrator runs:
+
+```powershell
+# Prerequisite: install only if Microsoft.Graph.Authentication is not already available.
+Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+
+$provision = @{
+    TenantId = '<TENANT-GUID>'
+    # Optional; omit to use the default name shown here.
+    DisplayName = 'Agent365IdentityProvisioner'
+}
+
+# Read-only preview; Microsoft Graph sign-in may be required.
+.\scripts\New-AgentIdentityProvisioningClient.ps1 @provision -WhatIf
+
+# Explicitly approve app configuration AND tenant-wide delegated admin consent.
+.\scripts\New-AgentIdentityProvisioningClient.ps1 @provision -Approve -GrantAdminConsent
+```
+
+For a different name, set `$provision.DisplayName`, or pass `-Name 'MyAgentProvisioner'` (`Name` is an alias for `DisplayName`). If the caller cannot grant admin consent, omit `-GrantAdminConsent`; an authorized consent administrator must grant the permissions before notebook sign-in.
+
+| Parameter | Purpose |
+| --- | --- |
+| `TenantId` | Required Entra tenant GUID. |
+| `DisplayName` / `Name` | Optional app name; defaults to `Agent365IdentityProvisioner`. |
+| `ApplicationObjectId` | Optional existing **application object ID**, not its client ID; use this to select an existing registration or resolve ambiguous names. |
+| `Approve` | Authorize app/service-principal changes. Without it, the script stops after a basic preview; `WhatIf` performs directory reads without writes. |
+| `GrantAdminConsent` | Separately authorize tenant-wide delegated consent; requires appropriate administrator authority. |
+
+The script prints `applicationObjectId` and `clientId`. Copy the **client ID** into `.env`:
+
+```dotenv
+ENTRA_PROVISIONING_CLIENT_ID=<CLIENT-ID-PRINTED-BY-THE-SCRIPT>
+```
+
+Rerun with the same name to reuse the registration; existing redirect URIs, API permissions, and consent scopes are preserved. If a later step fails or multiple registrations share the name, rerun with the printed `-ApplicationObjectId` to select the intended app. An unresolved creation must be reconciled in Entra rather than blindly repeated.
+
+The bootstrap administrator signs into Graph with `Application.ReadWrite.All` and, when granting consent, `DelegatedPermissionGrant.ReadWrite.All`. **Those bootstrap permissions are not added to the provisioning app.** Its requested permissions are only the eight delegated notebook scopes in the following table. The script does not grant Agent ID directory roles or establish Agent 365 licensing/eligibility.
+
 | Operation | Requested least-privilege delegated permissions |
 | --- | --- |
 | Create/read blueprint | `AgentIdentityBlueprint.Create`, `AgentIdentityBlueprint.Read.All` |

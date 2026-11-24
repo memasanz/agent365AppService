@@ -22,6 +22,183 @@ def powershell(script):
     return result.stdout
 
 
+@pytest.mark.parametrize("custom_name", [False, True])
+def test_provisioning_client_creation_reuse_and_consent_are_explicit(custom_name):
+    from src.onboarding import SCOPES
+
+    root = str(ROOT).replace("'", "''")
+    name = "CustomAgentProvisioner" if custom_name else "Agent365IdentityProvisioner"
+    name_argument = f"-Name '{name}'" if custom_name else ""
+    permissions = [
+        {"value": scope, "id": f"10000000-0000-0000-0000-{i:012d}", "isEnabled": True}
+        for i, scope in enumerate(SCOPES, start=1)
+    ]
+    metadata = json.dumps(permissions)
+    expected = json.dumps(list(SCOPES))
+    powershell(f"""
+        $ErrorActionPreference='Stop'
+        $scriptPath='{root}\\scripts\\New-AgentIdentityProvisioningClient.ps1'
+        $tenant='22222222-2222-2222-2222-222222222222'
+        $customName=${str(custom_name).lower()}
+        $global:Metadata='{metadata}' | ConvertFrom-Json -AsHashtable
+        $expected='{expected}' | ConvertFrom-Json
+        $global:App=$null; $global:ClientSp=$null; $global:Grant=$null
+        $global:AppCreates=0; $global:SpCreates=0; $global:GrantCreates=0
+        $global:Writes=0; $global:Connections=0; $global:CallerScopes=@()
+        $global:DuplicateNames=$false; $global:HideRegistration=$false
+        $global:WrongTenant=$false
+        function Get-Module {{ param($ListAvailable) return [pscustomobject]@{{Name='mock'}} }}
+        function Import-Module {{ param($Name) }}
+        function Connect-MgGraph {{
+            param($TenantId,$Scopes,$ContextScope,[switch]$NoWelcome)
+            $global:Connections++
+            $global:CallerScopes=$Scopes
+        }}
+        function Get-MgContext {{
+            $id=if ($global:WrongTenant) {{
+                '55555555-5555-5555-5555-555555555555'
+            }} else {{ $tenant }}
+            return [pscustomobject]@{{TenantId=$id;Scopes=$global:CallerScopes}}
+        }}
+        function Invoke-MgGraphRequest {{
+            param($Method,$Uri,$Body,$OutputType,$ContentType,$ErrorAction)
+            if (!$Uri.StartsWith('https://graph.microsoft.com/v1.0/')) {{ throw 'Unexpected API' }}
+            if ($Method -eq 'GET') {{
+                if ($Uri -match '/servicePrincipals\\?') {{
+                    if ($Uri.Contains('00000003-0000-0000-c000-000000000000')) {{
+                        $items=@($global:Metadata | Where-Object {{
+                            !$global:HideRegistration -or
+                                $_.value -ne 'AgentRegistration.ReadWrite.All'
+                        }})
+                        return @{{value=@(@{{id='graph-sp';oauth2PermissionScopes=$items}})}}
+                    }}
+                    $items=if ($global:ClientSp) {{ @($global:ClientSp) }} else {{ @() }}
+                    return @{{value=$items}}
+                }}
+                if ($Uri -match '/applications\\?') {{
+                    $items=if ($global:App) {{ @($global:App) }} else {{ @() }}
+                    if ($global:DuplicateNames) {{ $items=@($global:App,$global:App) }}
+                    return @{{value=$items}}
+                }}
+                if ($Uri -match '/applications/') {{ return $global:App }}
+                if ($Uri -match '/servicePrincipals/') {{ return $global:ClientSp }}
+                if ($Uri -match '/oauth2PermissionGrants\\?') {{
+                    $items=if ($global:Grant) {{ @($global:Grant) }} else {{ @() }}
+                    return @{{value=$items}}
+                }}
+                throw 'Unexpected read'
+            }}
+            $global:Writes++
+            $payload=$Body | ConvertFrom-Json -AsHashtable
+            if ($payload.ContainsKey('passwordCredentials') -or
+                $payload.ContainsKey('keyCredentials')) {{
+                throw 'Client credentials must not be created'
+            }}
+            if ($Uri -match '/applications') {{
+                if ($Method -eq 'POST') {{
+                    if ($payload.displayName -ne '{name}') {{
+                        throw 'Name override/default failed'
+                    }}
+                    $global:AppCreates++
+                    $global:App=@{{id='44444444-4444-4444-4444-444444444444'
+                        appId='11111111-1111-1111-1111-111111111111'}}
+                }}
+                foreach ($key in $payload.Keys) {{ $global:App[$key]=$payload[$key] }}
+                return $global:App
+            }}
+            if ($Uri -match '/servicePrincipals') {{
+                $global:SpCreates++
+                $global:ClientSp=@{{id='client-sp';appId=$payload.appId}}
+                return $global:ClientSp
+            }}
+            if ($Uri -match '/oauth2PermissionGrants') {{
+                if ($Method -eq 'POST') {{
+                    $global:GrantCreates++
+                    $global:Grant=@{{id='consent';consentType='AllPrincipals'}}
+                }}
+                foreach ($key in $payload.Keys) {{ $global:Grant[$key]=$payload[$key] }}
+                return $global:Grant
+            }}
+            throw 'Unexpected write'
+        }}
+        try {{ & $scriptPath -TenantId $tenant {name_argument}; throw 'Missing approval accepted' }}
+        catch {{ if ($_.Exception.Message -notlike 'Preview only*') {{ throw }} }}
+        if ($global:Writes -or $global:Connections) {{ throw 'Unapproved setup touched Graph' }}
+        & $scriptPath -TenantId $tenant {name_argument} -WhatIf
+        if ($global:Writes) {{ throw 'Preview changed the directory' }}
+        $first=& $scriptPath -TenantId $tenant {name_argument} -Approve
+        if ($global:GrantCreates -or
+            $global:CallerScopes -contains 'DelegatedPermissionGrant.ReadWrite.All') {{
+            throw 'Consent was not separately authorized'
+        }}
+        $graphAccess=$global:App.requiredResourceAccess[0].resourceAccess
+        if ($graphAccess.Count -ne $expected.Count -or
+            @($graphAccess | Where-Object {{ $_.type -ne 'Scope' }}).Count) {{
+            throw 'Wrong delegated permissions configured'
+        }}
+        foreach ($scope in $global:Metadata) {{
+            if ($scope.id -notin @($graphAccess.id)) {{ throw 'Required notebook scope missing' }}
+        }}
+        $global:App.publicClient.redirectUris+=@('http://localhost:9600')
+        $global:App.requiredResourceAccess[0].resourceAccess+=@(@{{id='extra-scope';type='Scope'}})
+        $global:App.requiredResourceAccess+=@(@{{resourceAppId='unrelated-api'
+            resourceAccess=@(@{{id='unrelated-role';type='Role'}})}})
+        if ($customName) {{
+            $global:Grant=@{{id='existing-consent';consentType='AllPrincipals';scope='Mail.Read'}}
+        }}
+        $second=& $scriptPath -TenantId $tenant {name_argument} `
+            -ApplicationObjectId $first.applicationObjectId -Approve -GrantAdminConsent
+        $third=& $scriptPath -TenantId $tenant {name_argument} -Approve -GrantAdminConsent
+        if ($global:AppCreates -ne 1 -or $global:SpCreates -ne 1 -or
+            $first.clientId -ne $second.clientId -or $first.clientId -ne $third.clientId) {{
+            throw 'Registration was duplicated on retry'
+        }}
+        if ($global:GrantCreates -ne $(if ($customName) {{0}} else {{1}})) {{
+            throw 'Consent grant was duplicated'
+        }}
+        $retainedGraph=@($global:App.requiredResourceAccess | Where-Object {{
+            $_.resourceAppId -eq '00000003-0000-0000-c000-000000000000'
+        }})[0]
+        if ('http://localhost:8400' -notin $global:App.publicClient.redirectUris -or
+            'http://localhost:9600' -notin $global:App.publicClient.redirectUris -or
+            'extra-scope' -notin $retainedGraph.resourceAccess.id -or
+            'unrelated-api' -notin $global:App.requiredResourceAccess.resourceAppId) {{
+            throw 'Existing redirects or permissions were overwritten'
+        }}
+        foreach ($scope in $expected) {{
+            if ($scope -notin @($global:Grant.scope -split ' ')) {{
+                throw 'Consent is missing a scope'
+            }}
+        }}
+        if ($customName -and 'Mail.Read' -notin @($global:Grant.scope -split ' ')) {{
+            throw 'Existing consent scopes were removed'
+        }}
+        $before=$global:Writes
+        $global:DuplicateNames=$true
+        try {{
+            & $scriptPath -TenantId $tenant {name_argument} -Approve
+            throw 'Ambiguous name accepted'
+        }}
+        catch {{ if ($_.Exception.Message -notlike 'Multiple applications*') {{ throw }} }}
+        $global:DuplicateNames=$false
+        $global:HideRegistration=$true
+        try {{
+            & $scriptPath -TenantId $tenant {name_argument} -Approve
+            throw 'Missing scope accepted'
+        }}
+        catch {{ if ($_.Exception.Message -notlike '*unavailable*') {{ throw }} }}
+        $global:HideRegistration=$false
+        $global:WrongTenant=$true
+        try {{
+            & $scriptPath -TenantId $tenant {name_argument} -Approve
+            throw 'Wrong tenant accepted'
+        }}
+        catch {{ if ($_.Exception.Message -notlike 'Graph sign-in tenant*') {{ throw }} }}
+        if ($global:Writes -ne $before) {{ throw 'A failed preflight changed directory objects' }}
+        Write-Output 'Provisioning regressions passed'
+    """)
+
+
 def test_powershell_scripts_parse_and_parameter_example_is_valid():
     root = str(ROOT).replace("'", "''")
     powershell(f"""
